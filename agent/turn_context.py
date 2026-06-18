@@ -1,23 +1,12 @@
-"""Per-turn setup for ``run_conversation`` (the turn prologue).
+"""每一轮 ``run_conversation`` 进入工具循环前的上下文准备。
 
-``run_conversation`` opened with ~470 lines of straight-line setup before the
-tool-calling loop ever started: stdio guarding, runtime-main wiring, retry-counter
-resets, user-message sanitization, todo/nudge-counter hydration, system-prompt
-restore-or-build, crash-resilience persistence, preflight context compression, the
-``pre_llm_call`` plugin hook, and external-memory prefetch.
+这里集中处理一次用户输入进入主循环前的所有“前置上下文工程”：
+stdio 防护、运行时主模型登记、重试计数重置、用户消息清洗、todo/memory
+计数恢复、system prompt 复用或重建、崩溃恢复持久化、预检压缩、
+``pre_llm_call`` 插件注入，以及外部记忆预取。
 
-All of that is *prologue* — it runs once per turn, has no back-references into the
-loop, and produces a fixed set of values the loop then consumes. ``TurnContext``
-captures those produced values; ``build_turn_context`` performs the setup work and
-returns one. ``run_conversation`` is left to unpack the context and run the loop,
-shrinking the orchestrator by the full prologue.
-
-The builder still mutates ``agent`` heavily (counters, thread id, cached prompt,
-session DB) exactly as the inline code did — those side effects are the point. The
-``TurnContext`` it returns carries only the *locals* the loop reads back.
-
-Behavior is identical to the original inline prologue; this is a pure
-move-and-name refactor with no semantic change.
+``build_turn_context`` 会有意修改 ``agent`` 的运行态；返回的
+``TurnContext`` 只保存主循环后续要读取的局部变量。
 """
 
 from __future__ import annotations
@@ -36,28 +25,28 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class TurnContext:
-    """Values produced by the turn prologue and consumed by the turn loop."""
+    """前置上下文阶段产物，供主工具循环继续使用。"""
 
-    # Sanitized inbound message (surrogates stripped).
+    # 清洗后的用户消息，会进入本轮消息列表。
     user_message: str
-    # Clean message preserved for transcripts / memory queries (no nudge injection).
+    # 原始用户消息，用于 transcript / memory 查询，不带系统注入的 nudge。
     original_user_message: Any
-    # Working message list for this turn (loop appends to it).
+    # 本轮工作消息列表，主循环会继续向其中追加 assistant/tool 消息。
     messages: List[Dict[str, Any]]
-    # May be reset to None by preflight compression (new session created).
+    # 预检压缩发生 session 轮换后会置空，避免旧历史被再次写入。
     conversation_history: Optional[List[Dict[str, Any]]]
-    # Cached system prompt active for this turn (may be rebuilt by compression).
+    # 本轮使用的 system prompt；压缩后可能被重建。
     active_system_prompt: Optional[str]
-    # Task / turn identifiers.
+    # 任务和轮次标识，贯穿工具调用、日志、状态回调。
     effective_task_id: str
     turn_id: str
-    # Index of the current user turn within ``messages``.
+    # 当前用户消息在 messages 中的下标。
     current_turn_user_idx: int
-    # Whether the post-turn memory review should fire.
+    # 本轮结束后是否触发 memory review。
     should_review_memory: bool = False
-    # Context contributed by ``pre_llm_call`` plugins (appended to user message).
+    # ``pre_llm_call`` 插件贡献的上下文，会追加到用户消息侧。
     plugin_user_context: str = ""
-    # External-memory prefetch result, reused across loop iterations.
+    # 外部记忆预取结果，主循环多次迭代复用。
     ext_prefetch_cache: str = ""
 
 
@@ -78,18 +67,13 @@ def build_turn_context(
     set_current_write_origin,
     ra,
 ) -> TurnContext:
-    """Run the once-per-turn setup and return the loop's input context.
-
-    The callables/helpers the original prologue referenced from the
-    ``conversation_loop`` module are passed in explicitly to keep this module
-    free of an import cycle with ``agent.conversation_loop``.
-    """
-    # Guard stdio against OSError from broken pipes (systemd/headless/daemon).
+    """执行单轮前置上下文准备，并返回主循环要消费的上下文对象。"""
+    # 防止 headless/systemd 等环境里的断管错误中断会话。
     install_safe_stdio()
 
     agent._ensure_db_session()
 
-    # Tell auxiliary_client what the live main provider/model are for this turn.
+    # 将本轮主模型运行时同步给 auxiliary_client，压缩/标题等辅助任务会用到。
     try:
         from agent.auxiliary_client import set_runtime_main
         set_runtime_main(
@@ -102,33 +86,33 @@ def build_turn_context(
     except Exception:
         pass
 
-    # Tag log records on this thread with the session ID for ``hermes logs``.
+    # 给当前线程日志打 session_id 标签，便于 hermes logs 过滤。
     set_session_context(agent.session_id)
 
-    # Bind the skill write-origin ContextVar for this thread.
+    # 绑定 skill 写入来源，memory/skill 写操作会读取这个 ContextVar。
     set_current_write_origin(getattr(agent, "_memory_write_origin", "assistant_tool"))
 
-    # Restore the primary runtime if the previous turn activated fallback.
+    # 如果上一轮启用了 fallback，这里恢复主运行时。
     agent._restore_primary_runtime()
 
-    # Sanitize surrogate characters from user input.
+    # 清理用户输入里的非法 surrogate 字符，避免 provider/JSON 编码失败。
     if isinstance(user_message, str):
         user_message = sanitize_surrogates(user_message)
     if isinstance(persist_user_message, str):
         persist_user_message = sanitize_surrogates(persist_user_message)
 
-    # Store stream callback for _interruptible_api_call to pick up.
+    # 保存流式回调，后续 _interruptible_api_call 会读取。
     agent._stream_callback = stream_callback
     agent._persist_user_message_idx = None
     agent._persist_user_message_override = persist_user_message
-    # Generate unique task_id if not provided to isolate VMs between tasks.
+    # 没有传入 task_id 时生成一个，隔离本轮工具 VM/缓存作用域。
     effective_task_id = task_id or str(uuid.uuid4())
     agent._current_task_id = effective_task_id
     turn_id = f"{agent.session_id or 'session'}:{effective_task_id}:{uuid.uuid4().hex[:8]}"
     agent._current_turn_id = turn_id
     agent._current_api_request_id = ""
 
-    # Reset retry counters and iteration budget at the start of each turn.
+    # 每轮开始都重置工具/JSON/空响应等重试计数。
     agent._invalid_tool_retries = 0
     agent._invalid_json_retries = 0
     agent._empty_content_retries = 0
@@ -144,7 +128,7 @@ def build_turn_context(
     agent._tool_guardrail_halt_decision = None
     agent._vision_supported = True
 
-    # Pre-turn connection health check: clean up dead TCP connections.
+    # 进入模型调用前清理上轮 provider 故障留下的死连接。
     if agent.api_mode != "anthropic_messages":
         try:
             if agent._cleanup_dead_connections():
@@ -155,15 +139,15 @@ def build_turn_context(
                 )
         except Exception:
             pass
-    # Replay compression warning through status_callback for gateway platforms.
+    # gateway 的 status_callback 初始化较晚，这里补发压缩配置警告。
     if agent._compression_warning:
         agent._replay_compression_warning()
         agent._compression_warning = None  # send once
 
-    # NOTE: _turns_since_memory and _iters_since_skill are NOT reset here.
+    # memory/skill 的周期计数跨轮累计，不能在这里清零。
     agent.iteration_budget = IterationBudget(agent.max_iterations)
 
-    # Log conversation turn start for debugging/observability.
+    # 记录本轮开始，用于调试和可观测性。
     _preview_text = summarize_user_message_for_log(user_message)
     _msg_preview = (_preview_text[:80] + "...") if len(_preview_text) > 80 else _preview_text
     _msg_preview = _msg_preview.replace("\n", " ")
@@ -174,14 +158,14 @@ def build_turn_context(
         _msg_preview,
     )
 
-    # Initialize conversation (copy to avoid mutating the caller's list).
+    # 复制历史消息，避免原地修改调用方传入的列表。
     messages = list(conversation_history) if conversation_history else []
 
-    # Hydrate todo store from conversation history.
+    # 从历史消息恢复 todo 状态。
     if conversation_history and not agent._todo_store.has_items():
         agent._hydrate_todo_store(conversation_history)
 
-    # Hydrate per-session nudge counters from persisted history (issue #22357).
+    # 从历史消息恢复 memory nudge 计数，避免 resume 后节奏丢失。
     if conversation_history and agent._user_turn_count == 0:
         prior_user_turns = sum(
             1 for m in conversation_history if m.get("role") == "user"
@@ -191,22 +175,22 @@ def build_turn_context(
             if agent._memory_nudge_interval > 0 and agent._turns_since_memory == 0:
                 agent._turns_since_memory = prior_user_turns % agent._memory_nudge_interval
 
-    # Track user turns for memory flush and periodic nudge logic.
+    # 统计用户轮次，供 memory flush 和周期提示使用。
     agent._user_turn_count += 1
 
-    # Reset the streaming context scrubber at the top of each turn.
+    # 重置流式输出 scrubber，避免跨轮残留标签状态。
     scrubber = getattr(agent, "_stream_context_scrubber", None)
     if scrubber is not None:
         scrubber.reset()
-    # Reset the think scrubber for the same reason.
+    # reasoning/think scrubber 也需要同样重置。
     think_scrubber = getattr(agent, "_stream_think_scrubber", None)
     if think_scrubber is not None:
         think_scrubber.reset()
 
-    # Preserve the original user message (no nudge injection).
+    # 保留用户原文，后续日志、memory 查询不能混入提示注入。
     original_user_message = persist_user_message if persist_user_message is not None else user_message
 
-    # Track memory nudge trigger (turn-based, checked here).
+    # 判断本轮是否需要触发 memory review 提醒。
     should_review_memory = False
     if (agent._memory_nudge_interval > 0
             and "memory" in agent.valid_tool_names
@@ -216,7 +200,7 @@ def build_turn_context(
             should_review_memory = True
             agent._turns_since_memory = 0
 
-    # Add user message.
+    # 将用户消息加入本轮消息列表，这是后续上下文压缩和模型调用的基础。
     user_msg = {"role": "user", "content": user_message}
     messages.append(user_msg)
     current_turn_user_idx = len(messages) - 1
@@ -229,13 +213,13 @@ def build_turn_context(
             f"{'...' if len(_print_preview) > 60 else ''}'"
         )
 
-    # ── System prompt (cached per session for prefix caching) ──
+    # System prompt 按 session 缓存，尽量保持 provider prefix cache 稳定。
     if agent._cached_system_prompt is None:
         restore_or_build_system_prompt(agent, system_message, conversation_history)
 
     active_system_prompt = agent._cached_system_prompt
 
-    # Crash-resilience: persist the inbound user turn as soon as the session row exists.
+    # 崩溃恢复：用户消息入队后尽早持久化。
     try:
         agent._persist_session(messages, conversation_history)
     except Exception:
@@ -245,7 +229,7 @@ def build_turn_context(
             exc_info=True,
         )
 
-    # ── Preflight context compression ──
+    # 预检压缩：在真正 API 调用前，用粗略估算提前判断是否需要 compact。
     if (
         agent.compression_enabled
         and len(messages) > agent.context_compressor.protect_first_n
@@ -298,7 +282,7 @@ def build_turn_context(
                     task_id=effective_task_id,
                 )
                 if len(messages) >= _orig_len:
-                    break  # Cannot compress further
+                    break  # 已无法进一步压缩，避免预检循环空转。
                 conversation_history = None
                 agent._empty_content_retries = 0
                 agent._thinking_prefill_retries = 0
@@ -313,7 +297,7 @@ def build_turn_context(
                 if not _compressor.should_compress(_preflight_tokens):
                     break
 
-    # Plugin hook: pre_llm_call (context injected into user message, not system prompt).
+    # 插件可在 LLM 调用前追加上下文；注入到用户消息侧，不污染 system prompt。
     plugin_user_context = ""
     try:
         from hermes_cli.plugins import invoke_hook as _invoke_hook
@@ -340,14 +324,13 @@ def build_turn_context(
     except Exception as exc:
         logger.warning("pre_llm_call hook failed: %s", exc)
 
-    # Per-turn file-mutation verifier state.
+    # 本轮文件修改校验状态。
     agent._turn_failed_file_mutations = {}
 
-    # Record the execution thread so interrupt()/clear_interrupt() can scope
-    # the tool-level interrupt signal to THIS agent's thread only.
+    # 记录执行线程，确保 interrupt 只影响当前 agent 线程。
     agent._execution_thread_id = threading.current_thread().ident
 
-    # Clear stale per-thread interrupt state, preserving a pending interrupt.
+    # 清掉旧线程中断状态，同时保留已经发起的 pending interrupt。
     ra()._set_interrupt(False, agent._execution_thread_id)
     if agent._interrupt_requested:
         ra()._set_interrupt(True, agent._execution_thread_id)
@@ -356,7 +339,7 @@ def build_turn_context(
         agent._interrupt_message = None
         agent._interrupt_thread_signal_pending = False
 
-    # Notify memory providers of the new turn (BEFORE prefetch_all).
+    # 在 memory 预取前通知 provider 新一轮开始。
     if agent._memory_manager:
         try:
             _turn_msg = original_user_message if isinstance(original_user_message, str) else ""
@@ -364,7 +347,7 @@ def build_turn_context(
         except Exception:
             pass
 
-    # External memory provider: prefetch once before the tool loop.
+    # 外部记忆每轮只预取一次，主循环内部复用。
     ext_prefetch_cache = ""
     if agent._memory_manager:
         try:

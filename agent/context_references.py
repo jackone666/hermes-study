@@ -39,6 +39,8 @@ _SENSITIVE_HOME_FILES = (
 
 @dataclass(frozen=True)
 class ContextReference:
+    """用户消息中解析出的一个 ``@`` 上下文引用。"""
+
     raw: str
     kind: str
     target: str
@@ -50,6 +52,8 @@ class ContextReference:
 
 @dataclass
 class ContextReferenceResult:
+    """显式引用展开后的消息、警告和 token 统计。"""
+
     message: str
     original_message: str
     references: list[ContextReference] = field(default_factory=list)
@@ -60,6 +64,7 @@ class ContextReferenceResult:
 
 
 def parse_context_references(message: str) -> list[ContextReference]:
+    """解析用户消息里的 ``@file``、``@folder``、``@diff``、``@url`` 等引用。"""
     refs: list[ContextReference] = []
     if not message:
         return refs
@@ -110,6 +115,7 @@ def preprocess_context_references(
     url_fetcher: Callable[[str], str | Awaitable[str]] | None = None,
     allowed_root: str | Path | None = None,
 ) -> ContextReferenceResult:
+    """同步包装器：展开用户显式引用并把内容拼回消息。"""
     coro = preprocess_context_references_async(
         message,
         cwd=cwd,
@@ -117,7 +123,7 @@ def preprocess_context_references(
         url_fetcher=url_fetcher,
         allowed_root=allowed_root,
     )
-    # Safe for both CLI (no loop) and gateway (loop already running).
+    # CLI 通常没有事件循环，gateway 可能已有事件循环；这里兼容两种入口。
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
@@ -137,13 +143,13 @@ async def preprocess_context_references_async(
     url_fetcher: Callable[[str], str | Awaitable[str]] | None = None,
     allowed_root: str | Path | None = None,
 ) -> ContextReferenceResult:
+    """异步展开 ``@`` 引用，并按上下文窗口比例限制注入体积。"""
     refs = parse_context_references(message)
     if not refs:
         return ContextReferenceResult(message=message, original_message=message)
 
     cwd_path = Path(cwd).expanduser().resolve()
-    # Default to the current working directory so @ references cannot escape
-    # the active workspace unless a caller explicitly widens the root.
+    # 默认只允许引用当前工作目录内的内容，调用方可显式放宽 allowed_root。
     allowed_root_path = (
         Path(allowed_root).expanduser().resolve() if allowed_root is not None else cwd_path
     )
@@ -210,6 +216,7 @@ async def _expand_reference(
     url_fetcher: Callable[[str], str | Awaitable[str]] | None = None,
     allowed_root: Path | None = None,
 ) -> tuple[str | None, str | None]:
+    """按引用类型分派到文件、目录、git 或 URL 展开逻辑。"""
     try:
         if ref.kind == "file":
             return _expand_file_reference(ref, cwd, allowed_root=allowed_root)
@@ -239,6 +246,7 @@ def _expand_file_reference(
     *,
     allowed_root: Path | None = None,
 ) -> tuple[str | None, str | None]:
+    """读取文本文件或指定行号范围，并包装成代码块注入上下文。"""
     path = _resolve_path(cwd, ref.target, allowed_root=allowed_root)
     _ensure_reference_path_allowed(path)
     if not path.exists():
@@ -266,6 +274,7 @@ def _expand_folder_reference(
     *,
     allowed_root: Path | None = None,
 ) -> tuple[str | None, str | None]:
+    """展开目录为受限深度/数量的文件树清单。"""
     path = _resolve_path(cwd, ref.target, allowed_root=allowed_root)
     _ensure_reference_path_allowed(path)
     if not path.exists():
@@ -283,6 +292,7 @@ def _expand_git_reference(
     args: list[str],
     label: str,
 ) -> tuple[str | None, str | None]:
+    """执行受控 git 子命令，并把输出作为 diff 代码块注入。"""
     try:
         result = subprocess.run(
             ["git", *args],
@@ -307,6 +317,7 @@ async def _fetch_url_content(
     *,
     url_fetcher: Callable[[str], str | Awaitable[str]] | None = None,
 ) -> str:
+    """通过调用方提供的 fetcher 或默认 web_extract 获取 URL 正文。"""
     fetcher = url_fetcher or _default_url_fetcher
     content = fetcher(url)
     if inspect.isawaitable(content):
@@ -315,6 +326,7 @@ async def _fetch_url_content(
 
 
 async def _default_url_fetcher(url: str) -> str:
+    """默认 URL 提取器，复用 Hermes 的 web_extract 工具。"""
     from tools.web_tools import web_extract_tool
 
     raw = await web_extract_tool([url], format="markdown", use_llm_processing=True)
@@ -327,6 +339,7 @@ async def _default_url_fetcher(url: str) -> str:
 
 
 def _resolve_path(cwd: Path, target: str, *, allowed_root: Path | None = None) -> Path:
+    """把用户给出的相对/绝对路径解析到真实路径，并校验工作区边界。"""
     path = Path(os.path.expanduser(target))
     if not path.is_absolute():
         path = cwd / path
@@ -340,6 +353,7 @@ def _resolve_path(cwd: Path, target: str, *, allowed_root: Path | None = None) -
 
 
 def _ensure_reference_path_allowed(path: Path) -> None:
+    """阻止把 SSH、云厂商配置、Hermes 密钥等敏感文件注入模型上下文。"""
     from hermes_constants import get_hermes_home
     home = Path(os.path.expanduser("~")).resolve()
     hermes_home = get_hermes_home().resolve()
@@ -361,6 +375,7 @@ def _ensure_reference_path_allowed(path: Path) -> None:
 
 
 def _strip_trailing_punctuation(value: str) -> str:
+    """去掉自然语言句尾标点，避免 ``@file:foo.py,`` 解析失败。"""
     stripped = value.rstrip(TRAILING_PUNCTUATION)
     while stripped.endswith((")", "]", "}")):
         closer = stripped[-1]
@@ -373,12 +388,14 @@ def _strip_trailing_punctuation(value: str) -> str:
 
 
 def _strip_reference_wrappers(value: str) -> str:
+    """去掉引用路径外层的反引号、单引号或双引号。"""
     if len(value) >= 2 and value[0] == value[-1] and value[0] in "`\"'":
         return value[1:-1]
     return value
 
 
 def _parse_file_reference_value(value: str) -> tuple[str, int | None, int | None]:
+    """解析 ``@file:path:10-20`` 这种可选行号范围。"""
     quoted_match = re.match(
         r'^(?P<quote>`|"|\')(?P<path>.+?)(?P=quote)(?::(?P<start>\d+)(?:-(?P<end>\d+))?)?$',
         value,
@@ -405,6 +422,7 @@ def _parse_file_reference_value(value: str) -> tuple[str, int | None, int | None
 
 
 def _remove_reference_tokens(message: str, refs: list[ContextReference]) -> str:
+    """从用户原消息中移除 ``@`` 引用 token，避免模型把它当作普通文本。"""
     pieces: list[str] = []
     cursor = 0
     for ref in refs:
@@ -418,6 +436,7 @@ def _remove_reference_tokens(message: str, refs: list[ContextReference]) -> str:
 
 
 def _is_binary_file(path: Path) -> bool:
+    """粗略判断文件是否为二进制，二进制内容不会直接注入上下文。"""
     mime, _ = mimetypes.guess_type(path.name)
     if mime and not mime.startswith("text/") and not any(
         path.name.endswith(ext) for ext in (".py", ".md", ".txt", ".json", ".yaml", ".yml", ".toml", ".js", ".ts")
@@ -428,6 +447,7 @@ def _is_binary_file(path: Path) -> bool:
 
 
 def _build_folder_listing(path: Path, cwd: Path, limit: int = 200) -> str:
+    """构造目录清单，优先展示相对路径和轻量元数据。"""
     lines = [f"{path.relative_to(cwd)}/"]
     entries = _iter_visible_entries(path, cwd, limit=limit)
     for entry in entries:
@@ -444,6 +464,7 @@ def _build_folder_listing(path: Path, cwd: Path, limit: int = 200) -> str:
 
 
 def _iter_visible_entries(path: Path, cwd: Path, limit: int) -> list[Path]:
+    """枚举可见目录项；优先使用 rg 遵守 gitignore，再退回 os.walk。"""
     rg_entries = _rg_files(path, cwd, limit=limit)
     if rg_entries is not None:
         output: list[Path] = []
@@ -475,6 +496,7 @@ def _iter_visible_entries(path: Path, cwd: Path, limit: int) -> list[Path]:
 
 
 def _rg_files(path: Path, cwd: Path, limit: int) -> list[Path] | None:
+    """用 ``rg --files`` 快速获取目录内文件列表。"""
     try:
         result = subprocess.run(
             ["rg", "--files", str(path.relative_to(cwd))],
@@ -492,6 +514,7 @@ def _rg_files(path: Path, cwd: Path, limit: int) -> list[Path] | None:
 
 
 def _file_metadata(path: Path) -> str:
+    """返回目录清单里展示的轻量文件元数据。"""
     if _is_binary_file(path):
         return f"{path.stat().st_size} bytes"
     try:
@@ -502,6 +525,7 @@ def _file_metadata(path: Path) -> str:
 
 
 def _code_fence_language(path: Path) -> str:
+    """根据文件后缀选择 Markdown 代码块语言。"""
     mapping = {
         ".py": "python",
         ".js": "javascript",

@@ -1454,19 +1454,19 @@ def init_agent(
                                     )
                     break
 
-    # Persist for reuse on switch_model / fallback activation. Must come
-    # AFTER the custom_providers branch so per-model overrides aren't lost.
+    # 保存配置里的上下文长度，供 switch_model / fallback 重新计算时复用。
+    # 必须放在 custom_providers 分支之后，避免覆盖每个模型的手动配置。
     agent._config_context_length = _config_context_length
 
     agent._ensure_lmstudio_runtime_loaded(_config_context_length)
 
 
 
-    # Select context engine: config-driven (like memory providers).
-    # 1. Check config.yaml context.engine setting
-    # 2. Check plugins/context_engine/<name>/ directory (repo-shipped)
-    # 3. Check general plugin system (user-installed plugins)
-    # 4. Fall back to built-in ContextCompressor
+    # 选择上下文引擎：优先读 config.yaml 的 context.engine。
+    # 1. compressor 表示内置 ContextCompressor。
+    # 2. 非 compressor 先查仓库内 plugins/context_engine/<name>/。
+    # 3. 再查用户安装的通用插件上下文引擎。
+    # 4. 找不到就回退内置 compressor。
     _selected_engine = None
     _engine_name = "compressor"  # default
     try:
@@ -1476,14 +1476,14 @@ def init_agent(
         pass
 
     if _engine_name != "compressor":
-        # Try loading from plugins/context_engine/<name>/
+        # 先尝试加载仓库内置上下文引擎插件。
         try:
             from plugins.context_engine import load_context_engine
             _selected_engine = load_context_engine(_engine_name)
         except Exception as _ce_load_err:
             _ra().logger.debug("Context engine load from plugins/context_engine/: %s", _ce_load_err)
 
-        # Try general plugin system as fallback
+        # 再尝试加载用户通用插件注册的上下文引擎。
         if _selected_engine is None:
             try:
                 from hermes_cli.plugins import get_plugin_context_engine
@@ -1498,11 +1498,11 @@ def init_agent(
                 "Context engine '%s' not found — falling back to built-in compressor",
                 _engine_name,
             )
-    # else: config says "compressor" — use built-in, don't auto-activate plugins
+    # 配置为 compressor 时只使用内置实现，不自动激活插件。
 
     if _selected_engine is not None:
         agent.context_compressor = _selected_engine
-        # Resolve context_length for plugin engines — mirrors switch_model() path
+        # 插件引擎也要解析当前模型上下文长度，与 switch_model 路径保持一致。
         from agent.model_metadata import get_model_context_length
         _plugin_ctx_len = get_model_context_length(
             agent.model,
@@ -1540,8 +1540,7 @@ def init_agent(
         )
     agent.compression_enabled = compression_enabled
 
-    # Reject models whose context window is below the minimum required
-    # for reliable tool-calling workflows (64K tokens).
+    # 上下文窗口低于 Hermes 工具工作流的最低要求时直接拒绝启动。
     _ctx = getattr(agent.context_compressor, "context_length", 0)
     if _ctx and _ctx < MINIMUM_CONTEXT_LENGTH:
         raise ValueError(
@@ -1552,20 +1551,8 @@ def init_agent(
             f"model.context_length in config.yaml to override."
         )
 
-    # Inject context engine tool schemas (e.g. lcm_grep, lcm_describe, lcm_expand).
-    # Skip names that are already present — the _ra().get_tool_definitions()
-    # quiet_mode cache returned a shared list pre-#17335, so a stray
-    # mutation here would poison subsequent agent inits in the same
-    # Gateway process and trip provider-side 'duplicate tool name'
-    # errors. Even with the cache fix, dedup is the right defense
-    # against plugin paths that may register the same schemas via
-    # ctx.register_tool(). Mirrors the memory tools dedup above.
-    #
-    # Respect the platform's enabled_toolsets configuration (#5544):
-    # context engine tools follow the same gating pattern as memory
-    # provider tools — without the gate, `platform_toolsets: telegram: []`
-    # would still leak lcm_* tools into the tool surface and incur the
-    # same local-model latency penalty.
+    # 注入上下文引擎专属工具 schema，例如 lcm_grep/lcm_describe/lcm_expand。
+    # 这里必须去重，并遵守 enabled_toolsets 对 context_engine 的开关。
     agent._context_engine_tool_names: set = set()
     if (
         hasattr(agent, "context_compressor")
@@ -1592,7 +1579,7 @@ def init_agent(
                 agent._context_engine_tool_names.add(_tname)
                 _existing_tool_names.add(_tname)
 
-    # Notify context engine of session start
+    # 通知上下文引擎当前 session 已开始，插件可在这里加载 DAG/索引等状态。
     if hasattr(agent, "context_compressor") and agent.context_compressor:
         try:
             agent.context_compressor.on_session_start(

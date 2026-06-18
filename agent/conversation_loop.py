@@ -397,13 +397,8 @@ def run_conversation(
         Dict: Complete conversation result with final response and message history
     """
     # ── Per-turn setup (the prologue) ──
-    # All once-per-turn setup — stdio guarding, retry-counter resets, user
-    # message sanitization, todo/nudge hydration, system-prompt restore-or-
-    # build, crash-resilience persistence, preflight compression, the
-    # ``pre_llm_call`` plugin hook, and external-memory prefetch — lives in
-    # ``build_turn_context``.  It mutates ``agent`` exactly as the inline code
-    # did and returns the locals the loop below reads back.  See
-    # ``agent/turn_context.py``.
+    # 每轮进入工具循环前的上下文准备集中在 build_turn_context：
+    # 清洗用户输入、恢复/构建 system prompt、预检压缩、插件上下文注入和 memory 预取。
     _ctx = build_turn_context(
         agent,
         user_message,
@@ -432,7 +427,7 @@ def run_conversation(
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
 
-    # Main conversation loop counters (pure locals consumed by the loop below).
+    # 主对话循环计数器，只在本轮循环内部消费。
     api_call_count = 0
     final_response = None
     interrupted = False
@@ -444,11 +439,7 @@ def run_conversation(
     compression_attempts = 0
     _turn_exit_reason = "unknown"  # Diagnostic: why the loop ended
 
-    # Optional opt-in runtime: if api_mode == codex_app_server, hand the
-    # turn to the codex app-server subprocess (terminal/file ops/patching
-    # all run inside Codex). Default Hermes path is bypassed entirely.
-    # See agent/transports/codex_app_server_session.py for the adapter
-    # and references/codex-app-server-runtime.md for the rationale.
+    # codex_app_server 模式会把本轮交给 Codex 子进程，绕过默认 Hermes 工具循环。
     if agent.api_mode == "codex_app_server":
         return agent._run_codex_app_server_turn(
             user_message=user_message,
@@ -1563,7 +1554,7 @@ def run_conversation(
                             "error": "First response truncated due to output length limit"
                         }
                 
-                # Track actual token usage from response for context management
+                # 把 provider 返回的真实 token usage 交给上下文引擎，后续压缩判断依赖它。
                 if hasattr(response, 'usage') and response.usage:
                     canonical_usage = normalize_usage(
                         response.usage,
@@ -1573,10 +1564,7 @@ def run_conversation(
                     prompt_tokens = canonical_usage.prompt_tokens
                     completion_tokens = canonical_usage.output_tokens
                     total_tokens = canonical_usage.total_tokens
-                    # Forward canonical token + cache buckets so context engines
-                    # can make decisions on cache hit ratios / reasoning costs,
-                    # not just legacy aggregate tokens. Legacy keys stay for
-                    # back-compat with engines that only read prompt/completion/total.
+                    # 同时传 legacy 和 canonical token 字段，兼容旧引擎和更细的统计。
                     usage_dict = {
                         "prompt_tokens": prompt_tokens,
                         "completion_tokens": completion_tokens,
@@ -1589,9 +1577,7 @@ def run_conversation(
                     }
                     agent.context_compressor.update_from_response(usage_dict)
 
-                    # Cache discovered context length after successful call.
-                    # Only persist limits confirmed by the provider (parsed
-                    # from the error message), not guessed probe tiers.
+                    # 成功调用后缓存已确认的上下文长度，只持久化 provider 明确确认的值。
                     if getattr(agent.context_compressor, "_context_probed", False):
                         ctx = agent.context_compressor.context_length
                         if getattr(agent.context_compressor, "_context_probe_persistable", False):
@@ -3758,29 +3744,16 @@ def run_conversation(
                 # results push past it, the next API call will report the
                 # real total and trigger compression then.
                 #
-                # If last_prompt_tokens is 0 (stale after API disconnect
-                # or provider returned no usage data), fall back to rough
-                # estimate to avoid missing compression.  Without this,
-                # a session can grow unbounded after disconnects because
-                # should_compress(0) never fires.  (#2153)
+                # 如果 provider 没有返回 usage，就用粗略估算兜底，避免压缩永远不触发。
                 _compressor = agent.context_compressor
                 if _compressor.last_prompt_tokens > 0:
-                    # Only use prompt_tokens — completion/reasoning
-                    # tokens don't consume context window space.
-                    # Thinking models (GLM-5.1, QwQ, DeepSeek R1)
-                    # inflate completion_tokens with reasoning,
-                    # causing premature compression.  (#12026)
+                    # 压缩判断只看 prompt_tokens，completion/reasoning 不占下一轮输入窗口。
                     _real_tokens = _compressor.last_prompt_tokens
                 elif _compressor.last_prompt_tokens == -1:
-                    # Compression just ran and no API-reported prompt count
-                    # has arrived yet. Avoid treating a schema-heavy rough
-                    # post-compression estimate as real context pressure.
+                    # 刚压缩后还没拿到真实 usage，避免把粗略估算当成真实压力。
                     _real_tokens = 0
                 else:
-                    # Include tool schemas — with 50+ tools enabled
-                    # these add 20-30K tokens the messages-only
-                    # estimate misses, which can skip compression
-                    # past the configured threshold (#14695).
+                    # 粗略估算要包含工具 schema，否则大工具面会严重低估输入 token。
                     _real_tokens = estimate_request_tokens_rough(
                         messages, tools=agent.tools or None
                     )
@@ -3792,9 +3765,7 @@ def run_conversation(
                         approx_tokens=agent.context_compressor.last_prompt_tokens,
                         task_id=effective_task_id,
                     )
-                    # Compression created a new session — clear history so
-                    # _flush_messages_to_session_db writes compressed messages
-                    # to the new session (see preflight compression comment).
+                    # 压缩会创建新 session，清空旧 history，确保后续 flush 写入新 session。
                     conversation_history = None
                 
                 # Save session log incrementally (so progress is visible even if interrupted)
