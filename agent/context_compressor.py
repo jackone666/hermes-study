@@ -53,14 +53,12 @@ SUMMARY_PREFIX = (
 )
 LEGACY_SUMMARY_PREFIX = "[CONTEXT SUMMARY]:"
 
-# Handoff prefixes that shipped in earlier releases. A summary persisted under
-# one of these can be inherited into a resumed lineage (#35344); when it is
-# re-normalized on re-compaction we must strip the OLD prefix too, otherwise the
-# stale directive it carried (e.g. "resume exactly from Active Task") survives
-# embedded in the body and keeps hijacking replies. Keep newest-first; entries
-# are matched literally. Add a frozen copy here whenever SUMMARY_PREFIX changes.
+# 早期版本写入过的 handoff 前缀。resume 旧 lineage 时可能继承这些摘要（#35344）；
+# 重新压缩时必须把旧前缀也剥掉，否则旧指令（例如“严格从 Active Task 继续”）
+# 会留在正文里继续污染后续回复。这里按新到旧排列，逐字匹配；以后
+# SUMMARY_PREFIX 改动时，也要在这里冻结一份旧值。
 _HISTORICAL_SUMMARY_PREFIXES = (
-    # Pre-#35344: contained the self-contradicting "resume exactly" directive.
+    # #35344 之前的版本：包含自相矛盾的“严格继续”指令。
     "[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were compacted "
     "into the summary below. This is a handoff from a previous context "
     "window — treat it as background reference, NOT as active instructions. "
@@ -73,33 +71,29 @@ _HISTORICAL_SUMMARY_PREFIXES = (
     "config, etc.) may reflect work described here — avoid repeating it:",
 )
 
-# Minimum tokens for the summary output
+# 摘要输出的最小 token 预算。
 _MIN_SUMMARY_TOKENS = 2000
-# Proportion of compressed content to allocate for summary
+# 被压缩内容中分配给摘要的比例。
 _SUMMARY_RATIO = 0.20
-# Absolute ceiling for summary tokens (even on very large context windows)
+# 摘要 token 的绝对上限，即使模型上下文窗口很大也不能超过。
 _SUMMARY_TOKENS_CEILING = 12_000
 
-# Placeholder used when pruning old tool results
+# 裁剪旧工具结果时写入的占位文本。
 _PRUNED_TOOL_PLACEHOLDER = "[Old tool output cleared to save context space]"
 
-# Chars per token rough estimate
+# 粗略估算时使用的字符/token 比例。
 _CHARS_PER_TOKEN = 4
-# Flat token cost per attached image part.  Real cost varies by provider and
-# dimensions (Anthropic ≈ width×height/750, GPT-4o up to ~1700 for
-# high-detail 2048×2048, Gemini 258/tile), but 1600 is a realistic ceiling
-# that keeps compression budgeting honest for multi-image conversations.
-# Matches Claude Code's IMAGE_TOKEN_ESTIMATE constant.
+# 每个图片 part 按固定 token 成本估算。真实成本随 provider 和尺寸变化
+#（Anthropic 约为 width×height/750，GPT-4o 高细节 2048×2048 可接近 1700，
+# Gemini 约 258/tile），1600 是一个较保守的上界，能让多图会话预算更可靠。
+# 与 Claude Code 的 IMAGE_TOKEN_ESTIMATE 常量保持一致。
 _IMAGE_TOKEN_ESTIMATE = 1600
-# Same figure expressed in the char-budget currency the rest of the
-# compressor speaks in.  Used when accumulating message "content length"
-# for tail-cut decisions.
+# 同一个图片成本换算成压缩器内部使用的字符预算单位；尾部切点计算会累加它。
 _IMAGE_CHAR_EQUIVALENT = _IMAGE_TOKEN_ESTIMATE * _CHARS_PER_TOKEN
 _SUMMARY_FAILURE_COOLDOWN_SECONDS = 600
 
-# Hard ceiling for the deterministic summary-failure handoff.  The fallback is
-# only meant to preserve continuity anchors from the dropped window, not to
-# become another unbounded transcript copy after the LLM summarizer failed.
+# 本地 deterministic fallback handoff 的硬上限。fallback 只负责保留被丢窗口里的
+# 连续性锚点，不应该在 LLM 摘要失败后变成另一份无限增长的 transcript 副本。
 _FALLBACK_SUMMARY_MAX_CHARS = 8_000
 _FALLBACK_TURN_MAX_CHARS = 700
 
@@ -156,9 +150,9 @@ def _content_length_for_budget(raw_content: Any) -> int:
         if ptype in {"image_url", "input_image", "image"}:
             total += _IMAGE_CHAR_EQUIVALENT
         else:
-            # text / input_text / tool_result-with-text / anything else with
-            # a text field.  Ignore the raw base64 payload inside image_url
-            # dicts — dimensions don't matter, only whether it's an image.
+            # text / input_text / 含 text 的 tool_result / 其他带 text 字段的 part。
+            # image_url 字典里的 base64 原文不计入字符长度；这里关心的是“有图片”，
+            # 图片成本已按固定 token 上界折算。
             total += len(p.get("text", "") or "")
     return total
 
@@ -233,7 +227,7 @@ def _truncate_tool_call_args_json(args: str, head_chars: int = 200) -> str:
         return obj
 
     shrunken = _shrink(parsed)
-    # ensure_ascii=False preserves CJK/emoji instead of bloating with \uXXXX
+    # ensure_ascii=False 保留中文和 emoji，避免被 \uXXXX 膨胀。
     return json.dumps(shrunken, ensure_ascii=False)
 
 
@@ -278,10 +272,9 @@ def _strip_historical_media(messages: List[Dict[str, Any]]) -> List[Dict[str, An
     if not messages:
         return messages
 
-    # Find the newest user message that carries at least one image part.
-    # We anchor on image-bearing user messages (not all user messages) so
-    # a plain text follow-up after a big-image turn still strips the old
-    # image — matching the problem kilocode#9434 set out to solve.
+    # 找到最新一条含图片的 user 消息。锚点只看“含图片的 user 消息”，
+    # 不看所有 user 消息；这样大图之后即使用户又发了纯文本追问，
+    # 旧图片仍会被裁掉，符合 kilocode#9434 要解决的问题。
     anchor = -1
     for i in range(len(messages) - 1, -1, -1):
         msg = messages[i]
@@ -294,8 +287,7 @@ def _strip_historical_media(messages: List[Dict[str, Any]]) -> List[Dict[str, An
             break
 
     if anchor <= 0:
-        # No image-bearing user message, or it's the very first message —
-        # nothing before it to strip.
+        # 没有含图片 user 消息，或它就是第一条消息：前面没有可裁剪内容。
         return messages
 
     changed = False
@@ -419,7 +411,7 @@ def _summarize_tool_result(tool_name: str, tool_args: str, tool_content: str) ->
         sid = args.get("session_id", "?")
         return f"[process] {action} session={sid}"
 
-    # Generic fallback
+    # 通用兜底摘要。
     first_arg = ""
     for k, v in list(args.items())[:2]:
         sv = str(v)[:40]
@@ -447,7 +439,7 @@ class ContextCompressor(ContextEngine):
         self._last_aux_model_failure_model = None
         self._last_compression_savings_pct = 100.0
         self._ineffective_compression_count = 0
-        self._summary_failure_cooldown_until = 0.0  # transient errors must not block a fresh session
+        self._summary_failure_cooldown_until = 0.0  # 新会话不继承上轮临时失败冷却
         self.last_real_prompt_tokens = 0
         self.last_compression_rough_tokens = 0
         self.last_rough_tokens_when_real_prompt_fit = 0
@@ -477,8 +469,7 @@ class ContextCompressor(ContextEngine):
             int(context_length * self.threshold_percent),
             MINIMUM_CONTEXT_LENGTH,
         )
-        # Recalculate token budgets for the new context length so the
-        # compressor stays calibrated after a model switch (e.g. 200K → 32K).
+        # 按新模型上下文窗口重算预算，避免模型切换后仍沿用旧阈值。
         target_tokens = int(self.threshold_tokens * self.summary_target_ratio)
         self.tail_token_budget = target_tokens
         self.max_summary_tokens = min(
@@ -511,10 +502,8 @@ class ContextCompressor(ContextEngine):
         self.protect_last_n = protect_last_n
         self.summary_target_ratio = max(0.10, min(summary_target_ratio, 0.80))
         self.quiet_mode = quiet_mode
-        # When True, summary-generation failure aborts compression entirely
-        # (returns messages unchanged, sets _last_compress_aborted=True).
-        # When False (default = historical behavior), insert a
-        # deterministic "summary unavailable" handoff and drop the middle window.
+        # True：摘要失败时完全中止压缩，原消息不变，并设置 _last_compress_aborted。
+        # False：保持历史行为，插入本地兜底交接摘要，再丢弃中间窗口。
         self.abort_on_summary_failure = abort_on_summary_failure
 
         self.context_length = get_model_context_length(
@@ -522,17 +511,14 @@ class ContextCompressor(ContextEngine):
             config_context_length=config_context_length,
             provider=provider,
         )
-        # Floor: never compress below MINIMUM_CONTEXT_LENGTH tokens even if
-        # the percentage would suggest a lower value.  This prevents premature
-        # compression on large-context models at 50% while keeping the % sane
-        # for models right at the minimum.
+        # 阈值下限不能低于 MINIMUM_CONTEXT_LENGTH，避免大上下文模型过早压缩。
         self.threshold_tokens = max(
             int(self.context_length * threshold_percent),
             MINIMUM_CONTEXT_LENGTH,
         )
         self.compression_count = 0
 
-        # Derive token budgets: ratio is relative to the threshold, not total context
+        # 预算按压缩阈值派生，而不是按整个上下文窗口派生。
         target_tokens = int(self.threshold_tokens * self.summary_target_ratio)
         self.tail_token_budget = target_tokens
         self.max_summary_tokens = min(
@@ -549,7 +535,7 @@ class ContextCompressor(ContextEngine):
                 self.tail_token_budget,
                 provider or "none", base_url or "none",
             )
-        self._context_probed = False  # True after a step-down from context error
+        self._context_probed = False  # 解析到 provider 降级后的上下文限制时置 True
 
         self.last_prompt_tokens = 0
         self.last_completion_tokens = 0
@@ -560,28 +546,19 @@ class ContextCompressor(ContextEngine):
 
         self.summary_model = summary_model_override or ""
 
-        # Stores the previous compaction summary for iterative updates
+        # 保存上一次 handoff summary，供下一次压缩做迭代更新。
         self._previous_summary: Optional[str] = None
-        # Anti-thrashing: track whether last compression was effective
+        # 抗空转：记录最近压缩是否真的节省了足够上下文。
         self._last_compression_savings_pct: float = 100.0
         self._ineffective_compression_count: int = 0
         self._summary_failure_cooldown_until: float = 0.0
         self._last_summary_error: Optional[str] = None
-        # When summary generation fails and a static fallback is inserted,
-        # record how many turns were unrecoverably dropped so callers
-        # (gateway hygiene, /compress) can surface a visible warning.
+        # 摘要失败且插入 fallback 时，记录被丢弃的 turns 数，供 gateway/手动压缩提示。
         self._last_summary_dropped_count: int = 0
         self._last_summary_fallback_used: bool = False
-        # When summary generation fails we now ABORT compression entirely
-        # and return the original messages unchanged instead of dropping
-        # the middle window with a static placeholder.  Callers inspect
-        # this flag to know "compression was attempted but aborted, freeze
-        # the chat until the user manually retries via /compress".
+        # 摘要失败并选择中止时，调用方用该标记判断压缩已尝试但未改变消息。
         self._last_compress_aborted: bool = False
-        # When a user-configured summary model fails and we recover by
-        # retrying on the main model, record the failure so gateway /
-        # CLI callers can still warn the user even though compression
-        # succeeded.  Silent recovery would hide the broken config.
+        # 用户配置的摘要模型失败但回退主模型成功时，也记录失败原因，方便提示配置问题。
         self._last_aux_model_failure_error: Optional[str] = None
         self._last_aux_model_failure_model: Optional[str] = None
 
@@ -625,7 +602,7 @@ class ContextCompressor(ContextEngine):
         tokens = prompt_tokens if prompt_tokens is not None else self.last_prompt_tokens
         if tokens < self.threshold_tokens:
             return False
-        # Anti-thrashing: back off if recent compressions were ineffective
+        # 抗空转：连续低收益压缩时退避，避免每轮都触发无效 compact。
         if self._ineffective_compression_count >= 2:
             if not self.quiet_mode:
                 logger.warning(
@@ -638,7 +615,7 @@ class ContextCompressor(ContextEngine):
         return True
 
     # ------------------------------------------------------------------
-    # Tool output pruning (cheap pre-pass, no LLM call)
+    # 工具输出裁剪：压缩前的本地廉价预处理，不调用 LLM。
     # ------------------------------------------------------------------
 
     def _prune_old_tool_results(
@@ -688,13 +665,8 @@ class ContextCompressor(ContextEngine):
                     break
                 accumulated += msg_tokens
                 boundary = i
-            # Translate the budget walk into a "protected count", apply the
-            # floor in count-space (where `max` reads naturally: protect at
-            # least `min_protect` messages or whatever the budget reserved,
-            # whichever is more), then convert back to a prune boundary.
-            # Doing this in index-space with `max` would invert the direction
-            # (smaller index = MORE protected), so a generous budget would
-            # silently get truncated back down to `min_protect`.
+            # 把 token 预算扫描结果先转成“受保护消息数量”，再应用最小保护条数。
+            # 不能直接在下标空间取 max，因为下标越小代表保护越多，会把方向弄反。
             budget_protect_count = len(result) - boundary
             protected_count = max(budget_protect_count, min_protect)
             prune_boundary = len(result) - protected_count
@@ -702,18 +674,17 @@ class ContextCompressor(ContextEngine):
             prune_boundary = len(result) - protect_tail_count
 
         # 第一遍：重复的大型 tool result 只保留最新完整副本。
-        content_hashes: dict = {}  # hash -> (index, tool_call_id)
+        content_hashes: dict = {}  # 内容哈希 -> (消息下标, tool_call_id)
         for i in range(len(result) - 1, -1, -1):
             msg = result[i]
             if msg.get("role") != "tool":
                 continue
             content = msg.get("content") or ""
-            # Multimodal content — dedupe by the text summary if available.
+            # 多模态内容跳过去重；这里只按纯文本内容哈希。
             if isinstance(content, list):
                 continue
             if not isinstance(content, str):
-                # Multimodal dict envelopes ({_multimodal: True, content: [...]}) and
-                # other non-string tool-result shapes can't be hashed/deduped by text.
+                # 多模态 dict 包装和其他非字符串结果无法按文本稳定去重。
                 continue
             if len(content) < 200:
                 continue
@@ -780,7 +751,7 @@ class ContextCompressor(ContextEngine):
         return result, pruned
 
     # ------------------------------------------------------------------
-    # Summarization
+    # 摘要生成。
     # ------------------------------------------------------------------
 
     def _compute_summary_budget(self, turns_to_summarize: List[Dict[str, Any]]) -> int:
@@ -790,11 +761,11 @@ class ContextCompressor(ContextEngine):
         return max(_MIN_SUMMARY_TOKENS, min(budget, self.max_summary_tokens))
 
     # 摘要模型输入截断上限：控制每条消息喂给 summary model 的最大字符量。
-    _CONTENT_MAX = 6000       # total chars per message body
-    _CONTENT_HEAD = 4000      # chars kept from the start
-    _CONTENT_TAIL = 1500      # chars kept from the end
-    _TOOL_ARGS_MAX = 1500     # tool call argument chars
-    _TOOL_ARGS_HEAD = 1200    # kept from the start of tool args
+    _CONTENT_MAX = 6000       # 每条消息正文最多喂给摘要模型的字符数
+    _CONTENT_HEAD = 4000      # 超长正文保留的头部字符数
+    _CONTENT_TAIL = 1500      # 超长正文保留的尾部字符数
+    _TOOL_ARGS_MAX = 1500     # tool_call 参数最多保留字符数
+    _TOOL_ARGS_HEAD = 1200    # 超长 tool_call 参数保留的头部字符数
 
     def _serialize_for_summary(self, turns: List[Dict[str, Any]]) -> str:
         """把待压缩消息序列化为带角色标签的文本，并先做敏感信息脱敏。"""
@@ -847,7 +818,7 @@ class ContextCompressor(ContextEngine):
         turns_to_summarize: List[Dict[str, Any]],
         reason: str | None = None,
     ) -> str:
-        """LLM 摘要不可用时，本地生成结构化 fallback handoff。"""
+        """LLM 摘要不可用时，本地生成结构化兜底交接摘要。"""
         user_asks: list[str] = []
         assistant_actions: list[str] = []
         tool_actions: list[str] = []
@@ -1035,8 +1006,8 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             _err_text = _err_text[:217].rstrip() + "..."
         self._last_aux_model_failure_error = _err_text
         self._last_aux_model_failure_model = self.summary_model
-        self.summary_model = ""  # empty = use main model
-        self._summary_failure_cooldown_until = 0.0  # no cooldown — retry immediately
+        self.summary_model = ""  # 空字符串表示改用主模型
+        self._summary_failure_cooldown_until = 0.0  # 清掉冷却，立刻重试
 
     def _generate_summary(
         self,
@@ -1215,26 +1186,25 @@ The user has requested that this compaction PRIORITISE preserving all informatio
                 },
                 "messages": [{"role": "user", "content": prompt}],
                 "max_tokens": int(summary_budget * 1.3),
-                # timeout resolved from auxiliary.compression.timeout config by call_llm
+                # timeout 由 call_llm 根据 auxiliary.compression.timeout 配置解析。
             }
             if self.summary_model:
                 call_kwargs["model"] = self.summary_model
             response = call_llm(**call_kwargs)
             content = response.choices[0].message.content
-            # Handle cases where content is not a string (e.g., dict from llama.cpp)
+            # 兼容某些后端返回非字符串 content 的情况。
             if not isinstance(content, str):
                 content = str(content) if content else ""
-            # Redact the summary output as well — the summarizer LLM may
-            # ignore prompt instructions and echo back secrets verbatim.
+            # 输出摘要也要脱敏，防止摘要模型照抄密钥或凭据。
             summary = redact_sensitive_text(content.strip())
-            # Store for iterative updates on next compaction
+            # 保存给下一次压缩做迭代更新。
             self._previous_summary = summary
             self._summary_failure_cooldown_until = 0.0
             self._summary_model_fallen_back = False
             self._last_summary_error = None
             return self._with_summary_prefix(summary)
         except RuntimeError:
-            # No provider configured — long cooldown, unlikely to self-resolve
+            # 没有可用 provider，短时间内通常不会自愈，进入较长冷却。
             self._summary_failure_cooldown_until = time.monotonic() + _SUMMARY_FAILURE_COOLDOWN_SECONDS
             self._last_summary_error = "no auxiliary LLM provider configured"
             logger.warning("Context compression: no provider available for "
@@ -1243,10 +1213,7 @@ The user has requested that this compaction PRIORITISE preserving all informatio
                             _SUMMARY_FAILURE_COOLDOWN_SECONDS)
             return None
         except Exception as e:
-            # If the summary model is different from the main model and the
-            # error looks permanent (model not found, 503, 404), fall back to
-            # using the main model instead of entering cooldown that leaves
-            # context growing unbounded.  (#8620 sub-issue 4)
+            # 摘要模型不同于主模型且错误像永久不可用时，回退主模型避免上下文继续膨胀。
             _status = getattr(e, "status_code", None) or getattr(getattr(e, "response", None), "status_code", None)
             _err_str = str(e).lower()
             _is_model_not_found = (
@@ -1259,25 +1226,13 @@ The user has requested that this compaction PRIORITISE preserving all informatio
                 _status in {408, 429, 502, 504}
                 or "timeout" in _err_str
             )
-            # Non-JSON / malformed-body responses from misconfigured providers
-            # or proxies (e.g. an HTML 502 page returned with
-            # ``Content-Type: application/json``) bubble up as
-            # ``json.JSONDecodeError`` from the OpenAI SDK's ``response.json()``,
-            # or as a wrapping ``APIResponseValidationError`` whose message
-            # carries the substring "expecting value".  Treat these like a
-            # transient provider failure: one retry on the main model, then a
-            # short cooldown.  Issue #22244.
+            # provider/proxy 返回伪 JSON 或畸形响应时，把它当临时失败处理：
+            # 先回退主模型重试一次，再进入短冷却。
             _is_json_decode = (
                 isinstance(e, json.JSONDecodeError)
                 or "expecting value" in _err_str
             )
-            # httpcore / httpx streaming premature-close errors surface as
-            # ConnectionError subclasses or plain Exception with characteristic
-            # substrings ("incomplete chunked read", "peer closed connection",
-            # "response ended prematurely", "unexpected eof").  These are
-            # transient network events; treat them like a timeout so we fall
-            # back to the main model instead of entering a 60-second cooldown.
-            # See issue #18458.
+            # 流式连接提前关闭通常是临时网络错误，按 timeout 处理并优先回退主模型。
             _is_streaming_closed = _is_connection_error(e)
             if _is_json_decode and not _is_model_not_found and not _is_timeout:
                 logger.error(
@@ -1305,17 +1260,9 @@ The user has requested that this compaction PRIORITISE preserving all informatio
                 else:
                     _reason = "timed out"
                 self._fallback_to_main_for_compression(e, _reason)
-                return self._generate_summary(turns_to_summarize, focus_topic=focus_topic)  # retry immediately
+                return self._generate_summary(turns_to_summarize, focus_topic=focus_topic)  # 立即重试
 
-            # Unknown-error best-effort retry on main model.  Losing N turns of
-            # context is almost always worse than one extra summary attempt, so
-            # if we haven't already fallen back and the summary model differs
-            # from the main model, try once more on main before entering
-            # cooldown.  Errors that DID match _is_model_not_found above are
-            # already handled by the fast-path retry; this branch catches
-            # everything else (400s, provider-specific "no route" strings,
-            # aggregator rejections, etc.) where auto-retry is still safer
-            # than dropping the turns.
+            # 未分类错误也尽量用主模型再试一次；多一次摘要尝试通常比丢上下文安全。
             if (
                 self.summary_model
                 and self.summary_model != self.model
@@ -1324,9 +1271,7 @@ The user has requested that this compaction PRIORITISE preserving all informatio
                 self._fallback_to_main_for_compression(e, "failed")
                 return self._generate_summary(turns_to_summarize, focus_topic=focus_topic)
 
-            # Transient errors (timeout, rate limit, network, JSON decode,
-            # streaming premature-close) — shorter cooldown for JSON decode and
-            # streaming-closed since those conditions can self-resolve quickly.
+            # 临时错误进入短冷却；JSON/流式关闭这类问题通常自愈更快。
             _transient_cooldown = 30 if (_is_json_decode or _is_streaming_closed) else 60
             self._summary_failure_cooldown_until = time.monotonic() + _transient_cooldown
             err_text = str(e).strip() or e.__class__.__name__
@@ -1378,7 +1323,7 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         return None, ""
 
     # ------------------------------------------------------------------
-    # Tool-call / tool-result pair integrity helpers
+    # tool_call / tool_result 配对完整性辅助方法。
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -1463,7 +1408,7 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         return idx
 
     # ------------------------------------------------------------------
-    # Tail protection by token budget
+    # 按 token 预算保护尾部上下文。
     # ------------------------------------------------------------------
 
     def _find_last_user_message_idx(
@@ -1514,7 +1459,7 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         min_tail = min(3, n - head_end - 1) if n - head_end > 1 else 0
         soft_ceiling = int(token_budget * 1.5)
         accumulated = 0
-        cut_idx = n  # start from beyond the end
+        cut_idx = n  # 从消息列表末尾之后开始向前扫描
 
         for i in range(n - 1, head_end - 1, -1):
             msg = messages[i]
@@ -1570,7 +1515,7 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         return max(cut_idx, head_end + 1)
 
     # ------------------------------------------------------------------
-    # ContextEngine: manual /compress preflight
+    # ContextEngine 接口：手动 /compress 的预检。
     # ------------------------------------------------------------------
 
     def has_content_to_compress(self, messages: List[Dict[str, Any]]) -> bool:
@@ -1580,7 +1525,7 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         return compress_start < compress_end
 
     # ------------------------------------------------------------------
-    # Main compression entry point
+    # 主压缩入口。
     # ------------------------------------------------------------------
 
     def compress(self, messages: List[Dict[str, Any]], current_tokens: int = None, focus_topic: str = None, force: bool = False) -> List[Dict[str, Any]]:
@@ -1682,7 +1627,7 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         # 摘要失败后的行为由 compression.abort_on_summary_failure 控制。
         if not summary and self.abort_on_summary_failure:
             n_skipped = compress_end - compress_start
-            self._last_summary_dropped_count = 0  # nothing actually dropped
+            self._last_summary_dropped_count = 0  # 实际没有丢弃任何消息
             self._last_summary_fallback_used = False
             self._last_compress_aborted = True
             if not self.quiet_mode:
@@ -1709,7 +1654,7 @@ The user has requested that this compaction PRIORITISE preserving all informatio
                     )
             compressed.append(msg)
 
-        # LLM 摘要失败时插入本地 fallback，保留最少可恢复锚点。
+        # LLM 摘要失败时插入本地兜底摘要，保留最少可恢复锚点。
         if not summary:
             if not self.quiet_mode:
                 logger.warning("Summary generation failed — inserting deterministic fallback context summary")
@@ -1729,8 +1674,7 @@ The user has requested that this compaction PRIORITISE preserving all informatio
             summary_role = "user"
         else:
             summary_role = "assistant"
-        # If the chosen role collides with the tail AND flipping wouldn't
-        # collide with the head, flip it.
+        # 如果 summary 角色和尾部冲突，且翻转后不会和头部冲突，就翻转角色。
         if summary_role == first_tail_role:
             flipped = "assistant" if summary_role == "user" else "user"
             if flipped != last_head_role:

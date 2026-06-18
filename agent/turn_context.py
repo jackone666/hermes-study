@@ -142,7 +142,7 @@ def build_turn_context(
     # gateway 的 status_callback 初始化较晚，这里补发压缩配置警告。
     if agent._compression_warning:
         agent._replay_compression_warning()
-        agent._compression_warning = None  # send once
+        agent._compression_warning = None  # 只补发一次
 
     # memory/skill 的周期计数跨轮累计，不能在这里清零。
     agent.iteration_budget = IterationBudget(agent.max_iterations)
@@ -213,7 +213,7 @@ def build_turn_context(
             f"{'...' if len(_print_preview) > 60 else ''}'"
         )
 
-    # System prompt 按 session 缓存，尽量保持 provider prefix cache 稳定。
+    # system prompt 按 session 缓存，尽量保持 provider 前缀缓存稳定。
     if agent._cached_system_prompt is None:
         restore_or_build_system_prompt(agent, system_message, conversation_history)
 
@@ -250,7 +250,7 @@ def build_turn_context(
 
         if not _preflight_deferred:
             _last = _compressor.last_prompt_tokens
-            # Do NOT overwrite the -1 sentinel (#36718).
+            # 不要覆盖 -1 哨兵值；它表示刚压缩完、还没拿到真实 usage。
             if _last >= 0 and _preflight_tokens > _last:
                 _compressor.last_prompt_tokens = _preflight_tokens
 

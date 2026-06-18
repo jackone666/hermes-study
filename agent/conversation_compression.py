@@ -91,9 +91,8 @@ def check_compression_model_feasibility(agent: Any) -> None:
             base_url=aux_base_url,
             api_key=aux_api_key,
             config_context_length=getattr(agent, "_aux_compression_context_length_config", None),
-            # Each model must be resolved with its own provider so that
-            # provider-specific paths (e.g. Bedrock static table, OpenRouter API)
-            # are invoked for the correct client, not inherited from the main model.
+            # 每个模型必须用自己的 provider 解析上下文长度，确保 Bedrock 静态表、
+            # OpenRouter API 等 provider 专属路径命中正确客户端，而不是沿用主模型。
             provider=(_aux_cfg_provider if _aux_cfg_provider and _aux_cfg_provider != "auto" else getattr(agent, "provider", "")),
             custom_providers=agent._custom_providers,
         )
@@ -234,7 +233,7 @@ def compress_context(
             )
         except Exception as _lock_err:
             # 版本偏移或锁方法缺失时只告警一次，然后无锁继续。
-            _lock_holder = None  # we don't own anything to release
+            _lock_holder = None  # 没有获得锁，不需要释放
             if getattr(agent, "_last_compression_lock_error_sid", None) != _lock_sid:
                 agent._last_compression_lock_error_sid = _lock_sid
                 logger.warning(
@@ -244,7 +243,7 @@ def compress_context(
                     "process (or `hermes update`) to resync.",
                     _lock_sid, type(_lock_err).__name__, _lock_err,
                 )
-            _lock_acquired = True  # treat as acquired-but-unlocked; proceed
+            _lock_acquired = True  # 视作“已允许但无锁”，继续执行
         if not _lock_acquired:
             try:
                 existing = _lock_db.get_compression_lock_holder(_lock_sid)
@@ -255,7 +254,7 @@ def compress_context(
                 "(holder=%s) — returning messages unchanged to avoid session fork",
                 _lock_sid, existing,
             )
-            _lock_holder = None  # don't release a lock we don't own
+            _lock_holder = None  # 没持有锁就不能释放
             # 面向用户只提示一次，避免 auto-compress 循环刷屏。
             if getattr(agent, "_last_compression_lock_warning_sid", None) != _lock_sid:
                 agent._last_compression_lock_warning_sid = _lock_sid
@@ -310,7 +309,7 @@ def compress_context(
         _existing_sp = getattr(agent, "_cached_system_prompt", None)
         if not _existing_sp:
             _existing_sp = agent._build_system_prompt(system_message)
-        _release_lock()  # compression aborted — no rotation will happen
+        _release_lock()  # 压缩中止，不会发生 session 轮换
         return messages, _existing_sp
 
     summary_error = getattr(agent.context_compressor, "_last_summary_error", None)
@@ -376,7 +375,7 @@ def compress_context(
                 parent_session_id=old_session_id,
             )
             agent._session_db_created = True
-            # Auto-number the title for the continuation session
+            # continuation session 标题沿用 lineage 并自动编号。
             if old_title:
                 try:
                     new_title = agent._session_db.get_next_title_in_lineage(old_title)
@@ -453,22 +452,11 @@ def compress_context(
 
 
 def try_shrink_image_parts_in_messages(api_messages: list) -> bool:
-    """Re-encode all native image parts at a smaller size to recover from
-    image-too-large errors (Anthropic 5 MB, unknown other providers).
+    """缩小消息里的 data URL 图片，用于从 provider 图片过大错误中恢复。
 
-    Mutates ``api_messages`` in place. Returns True if any image part was
-    actually replaced, False if there were no image parts to shrink or
-    Pillow couldn't help (caller should surface the original error).
-
-    Strategy: look for ``image_url`` / ``input_image`` parts carrying a
-    ``data:image/...;base64,...`` payload.  For each one whose encoded
-    size exceeds 4 MB (a safe target that slides under Anthropic's 5 MB
-    ceiling with header overhead), write the base64 to a tempfile, call
-    ``vision_tools._resize_image_for_vision`` to produce a smaller data
-    URL, and substitute it in place.
-
-    Non-data-URL images (http/https URLs) are not touched — the provider
-    fetches those itself and the size limit is different.
+    这个函数会原地修改 ``api_messages``。只处理 ``image_url`` /
+    ``input_image`` 中携带的 ``data:image/...;base64,...``，HTTP(S) 图片由
+    provider 自己拉取，大小限制不同，因此不在这里处理。
     """
     if not api_messages:
         return False
@@ -479,35 +467,23 @@ def try_shrink_image_parts_in_messages(api_messages: list) -> bool:
         logger.warning("image-shrink recovery: vision_tools unavailable — %s", exc)
         return False
 
-    # 4 MB target leaves comfortable headroom under Anthropic's 5 MB.
-    # Non-Anthropic providers we haven't observed rejecting are fine with
-    # much larger; shrinking to 4 MB here loses quality but only fires
-    # after a confirmed provider rejection, so the alternative is failure.
+    # 4 MB 目标值给 Anthropic 5 MB 上限留出余量；该路径只在 provider 已拒绝后触发。
     target_bytes = 4 * 1024 * 1024
-    # Anthropic enforces an 8000px per-side dimension cap independently of
-    # the 5 MB byte cap.  A tall screenshot can be well under 5 MB yet far
-    # over 8000px (e.g. 1200×12000 at 0.06 MB).  We check pixel dimensions
-    # even when the byte budget is fine.
+    # Anthropic 还限制单边 8000px，所以即使字节数合格，也要检查像素尺寸。
     max_dimension = 8000
     changed_count = 0
-    # Track parts that are over the target but could NOT be shrunk under it.
-    # If any survive, retrying is pointless — the same oversized payload will
-    # be re-sent and rejected again, wasting the single retry budget.  We only
-    # report success (caller retries) when every over-threshold image was
-    # actually brought under the target.
+    # 记录无法缩到目标以内的图片；只要有一个失败，重试也会发送同样的拒绝 payload。
     unshrinkable_oversized = 0
 
     def _shrink_data_url(url: str) -> Optional[str]:
-        """Return a smaller data URL, or None if shrink can't help."""
+        """返回更小的 data URL；无法缩小时返回 None。"""
         if not isinstance(url, str) or not url.startswith("data:"):
             return None
 
-        # Check both byte size AND pixel dimensions.
-        needs_shrink = len(url) > target_bytes  # over byte budget
+        # 同时检查字节数和像素尺寸。
+        needs_shrink = len(url) > target_bytes  # 超过字节预算
         if not needs_shrink:
-            # Even if bytes are fine, check pixel dimensions against
-            # Anthropic's 8000px cap.  A tall image can be tiny in bytes
-            # yet huge in pixels.
+            # 字节数合格时仍检查像素尺寸，细长截图可能字节小但单边超限。
             try:
                 import base64 as _b64_dim
                 header_d, _, data_d = url.partition(",")
@@ -518,11 +494,10 @@ def try_shrink_image_parts_in_messages(api_messages: list) -> bool:
                 import io as _io_dim
                 with _PILImage.open(_io_dim.BytesIO(raw_d)) as _img:
                     if max(_img.size) <= max_dimension:
-                        return None  # both bytes and pixels are fine
-                needs_shrink = True  # pixels exceed limit, force shrink
+                        return None  # 字节和像素都合格
+                needs_shrink = True  # 像素超限，强制缩图
             except Exception:
-                # If we can't check dimensions (Pillow unavailable, corrupt
-                # image, etc.), fall back to byte-only check.
+                # 无法检查尺寸时退回字节数判断。
                 return None
 
         try:
@@ -556,7 +531,7 @@ def try_shrink_image_parts_in_messages(api_messages: list) -> bool:
                 except Exception:
                     pass
             if not resized or len(resized) >= len(url):
-                # Shrink didn't help (or made it bigger — corrupt input?).
+                # 缩图没有帮助，或者结果反而更大。
                 return None
             return resized
         except Exception as exc:
@@ -576,8 +551,7 @@ def try_shrink_image_parts_in_messages(api_messages: list) -> bool:
             if ptype not in {"image_url", "input_image"}:
                 continue
             image_value = part.get("image_url")
-            # OpenAI chat.completions: {"image_url": {"url": "data:..."}}
-            # OpenAI Responses: {"image_url": "data:..."}
+            # OpenAI chat.completions 是 dict 形态；Responses 是字符串形态。
             if isinstance(image_value, dict):
                 url = image_value.get("url", "")
                 resized = _shrink_data_url(url)
@@ -602,10 +576,7 @@ def try_shrink_image_parts_in_messages(api_messages: list) -> bool:
             changed_count, target_bytes / (1024 * 1024),
         )
     if unshrinkable_oversized:
-        # At least one oversized image could not be shrunk under the target.
-        # Retrying would re-send it and fail identically, so signal "no
-        # progress" even if other parts shrank — the caller will surface the
-        # original error rather than burning its single retry on a no-op.
+        # 至少一张图片没能缩到目标以内；返回 False 让调用方直接展示原错误。
         logger.warning(
             "image-shrink recovery: %d oversized image part(s) could not be "
             "shrunk under %.0f MB — not retrying (would re-send rejected payload)",

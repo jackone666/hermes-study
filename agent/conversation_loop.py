@@ -378,25 +378,20 @@ def run_conversation(
     persist_user_message: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Run a complete conversation with tool calling until completion.
+    执行一轮完整对话，直到模型给出最终回复或工具调用循环结束。
 
-    Args:
-        user_message (str): The user's message/question
-        system_message (str): Custom system message (optional, overrides ephemeral_system_prompt if provided)
-        conversation_history (List[Dict]): Previous conversation messages (optional)
-        task_id (str): Unique identifier for this task to isolate VMs between concurrent tasks (optional, auto-generated if not provided)
-        stream_callback: Optional callback invoked with each text delta during streaming.
-            Used by the TTS pipeline to start audio generation before the full response.
-            When None (default), API calls use the standard non-streaming path.
-        persist_user_message: Optional clean user message to store in
-            transcripts/history when user_message contains API-only
-            synthetic prefixes.
-                or queuing follow-up prefetch work.
+    参数：
+        user_message: 用户输入的原始问题或指令。
+        system_message: 可选自定义 system prompt；传入后会覆盖临时 system prompt。
+        conversation_history: 进入本轮前已有的 OpenAI 消息历史。
+        task_id: 当前任务唯一 ID，用于隔离并发任务的终端/VM 等运行环境。
+        stream_callback: 流式输出回调；TTS 会用它在完整回复结束前提前生成语音。
+        persist_user_message: 当 user_message 含 API 专用前缀时，用这个干净版本落库。
 
-    Returns:
-        Dict: Complete conversation result with final response and message history
+    返回：
+        包含 final_response 和更新后消息历史的结果字典。
     """
-    # ── Per-turn setup (the prologue) ──
+    # ── 每轮准备阶段（prologue） ──
     # 每轮进入工具循环前的上下文准备集中在 build_turn_context：
     # 清洗用户输入、恢复/构建 system prompt、预检压缩、插件上下文注入和 memory 预取。
     _ctx = build_turn_context(
@@ -3728,21 +3723,17 @@ def run_conversation(
                 # arrives.
                 agent._stream_needs_break = True
 
-                # Refund the iteration if the ONLY tool(s) called were
-                # execute_code (programmatic tool calling).  These are
-                # cheap RPC-style calls that shouldn't eat the budget.
+                # 如果本轮只调用 execute_code（程序化工具调用），退回一次迭代预算；
+                # 这类 RPC 式调用很轻，不应该消耗主对话预算。
                 _tc_names = {tc.function.name for tc in assistant_message.tool_calls}
                 if _tc_names == {"execute_code"}:
                     agent.iteration_budget.refund()
                 
-                # Use real token counts from the API response to decide
-                # compression.  prompt_tokens + completion_tokens is the
-                # actual context size the provider reported plus the
-                # assistant turn — a tight lower bound for the next prompt.
-                # Tool results appended above aren't counted yet, but the
-                # threshold (default 50%) leaves ample headroom; if tool
-                # results push past it, the next API call will report the
-                # real total and trigger compression then.
+                # 优先用 API 返回的真实 token 统计判断是否压缩。
+                # prompt_tokens + completion_tokens 是 provider 报告的上下文规模
+                # 加上 assistant 本轮输出，基本等于下一轮 prompt 的紧下界。
+                # 上面刚追加的工具结果还没计入，但默认 50% 阈值会留出足够余量；
+                # 如果工具结果真的把窗口撑爆，下一次 API usage 会反映出来并触发压缩。
                 #
                 # 如果 provider 没有返回 usage，就用粗略估算兜底，避免压缩永远不触发。
                 _compressor = agent.context_compressor

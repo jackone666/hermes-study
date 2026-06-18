@@ -1468,7 +1468,7 @@ def init_agent(
     # 3. 再查用户安装的通用插件上下文引擎。
     # 4. 找不到就回退内置 compressor。
     _selected_engine = None
-    _engine_name = "compressor"  # default
+    _engine_name = "compressor"  # 默认使用内置压缩器
     try:
         _ctx_cfg = _agent_cfg.get("context", {}) if isinstance(_agent_cfg, dict) else {}
         _engine_name = _ctx_cfg.get("engine", "compressor") or "compressor"
@@ -1571,7 +1571,7 @@ def init_agent(
         for _schema in agent.context_compressor.get_tool_schemas():
             _tname = _schema.get("name", "")
             if _tname and _tname in _existing_tool_names:
-                continue  # already registered via plugin/cache path
+                continue  # 已经通过插件或缓存路径注册过，避免重复工具名
             _wrapped = {"type": "function", "function": _schema}
             agent.tools.append(_wrapped)
             if _tname:
@@ -1598,7 +1598,7 @@ def init_agent(
     )
     agent._user_turn_count = 0
 
-    # Cumulative token usage for the session
+    # 当前 session 的累计 token 用量统计。
     agent.session_prompt_tokens = 0
     agent.session_completion_tokens = 0
     agent.session_total_tokens = 0

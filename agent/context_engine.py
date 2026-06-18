@@ -23,7 +23,7 @@ from typing import Any, Dict, List
 class ContextEngine(ABC):
     """所有上下文引擎都必须实现的抽象基类。"""
 
-    # -- Identity ----------------------------------------------------------
+    # -- 身份标识 ----------------------------------------------------------
 
     @property
     @abstractmethod
@@ -45,7 +45,7 @@ class ContextEngine(ABC):
     protect_first_n: int = 3
     protect_last_n: int = 6
 
-    # -- Core interface ----------------------------------------------------
+    # -- 核心接口 ----------------------------------------------------------
 
     @abstractmethod
     def update_from_response(self, usage: Dict[str, Any]) -> None:
@@ -64,7 +64,7 @@ class ContextEngine(ABC):
     ) -> List[Dict[str, Any]]:
         """压缩消息列表并返回新的 OpenAI 格式消息序列。"""
 
-    # -- Optional: pre-flight check ----------------------------------------
+    # -- 可选：API 调用前预检 ---------------------------------------------
 
     def should_compress_preflight(self, messages: List[Dict[str, Any]]) -> bool:
         """API 调用前的粗略压缩预检；默认不启用。"""
@@ -74,13 +74,13 @@ class ContextEngine(ABC):
         """粗略估算明显偏噪时，是否改信最近一次真实 provider usage。"""
         return False
 
-    # -- Optional: manual /compress preflight ------------------------------
+    # -- 可选：手动 /compress 预检 ----------------------------------------
 
     def has_content_to_compress(self, messages: List[Dict[str, Any]]) -> bool:
         """供手动 ``/compress`` 使用：当前消息里是否存在可压缩中间区。"""
         return True
 
-    # -- Optional: session lifecycle ---------------------------------------
+    # -- 可选：session 生命周期 -------------------------------------------
 
     def on_session_start(self, session_id: str, **kwargs) -> None:
         """会话开始或压缩轮换 session_id 后调用，可加载/继承引擎状态。"""
@@ -95,7 +95,7 @@ class ContextEngine(ABC):
         self.last_total_tokens = 0
         self.compression_count = 0
 
-    # -- Optional: tools ---------------------------------------------------
+    # -- 可选：引擎专属工具 -----------------------------------------------
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         """返回该上下文引擎额外暴露给模型调用的工具 schema。"""
@@ -106,7 +106,7 @@ class ContextEngine(ABC):
         import json
         return json.dumps({"error": f"Unknown context engine tool: {name}"})
 
-    # -- Optional: status / display ----------------------------------------
+    # -- 可选：状态展示 ----------------------------------------------------
 
     def get_status(self) -> Dict[str, Any]:
         """返回展示和日志需要的上下文引擎状态。"""
@@ -121,7 +121,7 @@ class ContextEngine(ABC):
             "compression_count": self.compression_count,
         }
 
-    # -- Optional: model switch support ------------------------------------
+    # -- 可选：模型切换支持 -----------------------------------------------
 
     def update_model(
         self,
